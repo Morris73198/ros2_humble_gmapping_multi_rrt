@@ -1,61 +1,56 @@
 #!/usr/bin/env python3
 
-# CNN + DQN one robot
-
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped, Twist
+from geometry_msgs.msg import PoseStamped, Point, Twist
 from visualization_msgs.msg import MarkerArray, Marker
-from nav_msgs.msg import OccupancyGrid
-from std_msgs.msg import String, ColorRGBA
+from nav_msgs.msg import OccupancyGrid, Path
+from std_msgs.msg import String, ColorRGBA, Float32MultiArray
 import numpy as np
-import tensorflow as tf
+import heapq
+from typing import List, Tuple, Set
 import cv2
 import os
-from rrt_exploration_ros2.network import FrontierNetworkModel
+import tensorflow as tf
 
-class DLAssigner(Node):
+# 導入DRL模型相關模塊
+try:
+    from rrt_exploration_ros2.multi_robot_network import MultiRobotNetworkModel
+except ImportError:
+    try:
+        # 嘗試其他可能的導入路徑
+        from two_robot_dueling_dqn_attention.models.multi_robot_network import MultiRobotNetworkModel
+    except ImportError:
+        MultiRobotNetworkModel = None
+        print("警告: 無法導入 MultiRobotNetworkModel，將使用距離基礎分配")
+
+class DRLAssigner(Node):
     def __init__(self):
-        super().__init__('dl_assigner')
+        super().__init__('drl_assigner')
         
-        # 初始化神經網路模型
-        self.model = FrontierNetworkModel(
-            input_shape=(84, 84, 1),
-            max_frontiers=50
-        )
+        # 首先設置所有基本參數（在載入模型之前）
+        # DRL模型相關參數
+        self.map_size_for_model = (84, 84)  # 模型輸入的地圖尺寸
+        self.max_frontiers = 50  # 最大frontier點數量
         
-        # 獲取package的安装路径
-        import ament_index_python
-        package_path = ament_index_python.get_package_share_directory('rrt_exploration_ros2')
+        # 聲明模型路徑參數 - 設置默認路徑到您的模型目錄
+        default_model_path = '/home/airlab/rrt_ws/src/ros2_humble_gmapping_multi_rrt/rrt_exploration_ros2/rrt_exploration_ros2/saved_models/robot_rl_model.h5'
+        self.declare_parameter('model_path', default_model_path)
+        self.declare_parameter('use_drl', True)  # 默認啟用DRL
         
-        # 建構模型文件的完整路徑
-        default_model_path = os.path.join(package_path, 'saved_models', 'frontier_model_ep000740.h5')
-        model_path = self.declare_parameter('model_path', default_model_path).value
-        
-        self.get_logger().info(f'Loading model from: {model_path}')
-        
-        if not os.path.exists(model_path):
-            error_msg = f'Model file not found at {model_path}'
-            self.get_logger().error(error_msg)
-            raise FileNotFoundError(error_msg)
-            
-        try:
-            self.model.load(model_path)
-            self.get_logger().info('Model loaded successfully')
-        except Exception as e:
-            self.get_logger().error(f'Failed to load model: {str(e)}')
-            raise
+        self.model_path = self.get_parameter('model_path').value
+        self.use_drl = self.get_parameter('use_drl').value
         
         # 初始化變量
         self.robot1_pose = None
         self.robot2_pose = None
         self.available_points = []
         self.assigned_targets = {'robot1': None, 'robot2': None}
-        self.robot_status = {'robot1': True, 'robot2': True}
+        self.robot_status = {'robot1': True, 'robot2': True}  # True 表示機器人可以接收新目標
         
         # 機器人速度相關變量
         self.robot_velocities = {'robot1': None, 'robot2': None}
-        self.velocity_check_threshold = 0.01  # 速度閾值，用於判斷機器人是否靜止
+        self.velocity_check_threshold = 0.01  # 速度閾值
         self.static_duration = {'robot1': 0.0, 'robot2': 0.0}  # 記錄機器人靜止的持續時間
         self.static_threshold = 2.0  # 靜止超過此時間（秒）就重新分配目標
         
@@ -65,12 +60,89 @@ class DLAssigner(Node):
         self.map_width = None
         self.map_height = None
         self.map_origin = None
-        self.processed_map = None
+        self.processed_map = None  # 處理後的地圖，用於DRL模型
         
         # 目標到達閾值
-        self.target_threshold = 0.3
+        self.target_threshold = 0.3  # 機器人距離目標點小於此值視為到達
         
-        # 設置訂閱者
+        # 初始化DRL模型（在所有參數設置完成後）
+        self.drl_model = None
+        if self.use_drl:
+            self.load_drl_model()
+        
+        # 設置訂閱者和發布者
+        self.setup_subscribers()
+        self.setup_publishers()
+        
+        # 創建定時器
+        self.create_timer(1.0, self.assign_targets)
+        self.create_timer(0.1, self.publish_visualization)
+        self.create_timer(0.1, self.check_target_reached)
+        self.create_timer(0.1, self.check_robot_motion)
+        
+        mode = "DRL增強" if self.use_drl and self.drl_model else "距離基礎"
+        self.get_logger().info(f'{mode}的分配節點已啟動')
+        if self.use_drl:
+            self.get_logger().info(f'模型路徑: {self.model_path}')
+
+    def load_drl_model(self):
+        """載入預訓練的DRL模型"""
+        try:
+            # 檢查模型類是否可用
+            if MultiRobotNetworkModel is None:
+                self.get_logger().error('MultiRobotNetworkModel 類不可用，請檢查導入路徑')
+                self.use_drl = False
+                return
+                
+            # 檢查模型文件是否存在
+            if not os.path.exists(self.model_path):
+                # 嘗試尋找模型目錄中的其他模型文件
+                model_dir = '/home/airlab/rrt_ws/src/ros2_humble_gmapping_multi_rrt/rrt_exploration_ros2/rrt_exploration_ros2/saved_models/'
+                self.get_logger().info(f'模型文件不存在: {self.model_path}')
+                self.get_logger().info(f'正在搜索模型目錄: {model_dir}')
+                
+                if os.path.exists(model_dir):
+                    # 列出目錄中的所有 .h5 文件
+                    h5_files = [f for f in os.listdir(model_dir) if f.endswith('.h5')]
+                    if h5_files:
+                        self.get_logger().info(f'找到的模型文件: {h5_files}')
+                        # 使用第一個找到的 .h5 文件
+                        self.model_path = os.path.join(model_dir, h5_files[0])
+                        self.get_logger().info(f'使用模型文件: {self.model_path}')
+                    else:
+                        self.get_logger().warn(f'在 {model_dir} 中未找到 .h5 模型文件')
+                        self.get_logger().info('將使用距離基礎分配方法')
+                        self.use_drl = False
+                        return
+                else:
+                    self.get_logger().error(f'模型目錄不存在: {model_dir}')
+                    self.use_drl = False
+                    return
+            
+            # 檢查 TensorFlow 版本是否過新，dueling.h5 可能是舊格式
+            if 'dueling.h5' in self.model_path:
+                self.get_logger().warn('檢測到 dueling.h5 文件，這可能不是正確的 MultiRobotNetworkModel 格式')
+                self.get_logger().warn('如果載入失敗，將自動切換到距離基礎分配方法')
+            
+            # 初始化模型
+            self.drl_model = MultiRobotNetworkModel(
+                input_shape=(84, 84, 1),
+                max_frontiers=self.max_frontiers
+            )
+            
+            # 載入預訓練權重
+            self.drl_model.load(self.model_path)
+            
+            self.get_logger().info(f'成功載入DRL模型: {self.model_path}')
+            
+        except Exception as e:
+            self.get_logger().error(f'載入DRL模型失敗: {str(e)}')
+            self.get_logger().info('將使用距離基礎分配方法')
+            self.drl_model = None
+            self.use_drl = False
+
+    def setup_subscribers(self):
+        """設置所有訂閱者"""
         self.map_sub = self.create_subscription(
             OccupancyGrid,
             '/merge_map',
@@ -113,8 +185,10 @@ class DLAssigner(Node):
             lambda msg: self.cmd_vel_callback(msg, 'robot2'),
             10
         )
-            
-        # 設置發布者
+
+    def setup_publishers(self):
+        """設置所有發布者"""
+        # 目標點發布
         self.robot1_target_pub = self.create_publisher(
             PoseStamped,
             '/robot1/goal_pose',
@@ -126,57 +200,112 @@ class DLAssigner(Node):
             '/robot2/goal_pose',
             10
         )
-        
+
+        # 可視化發布
         self.target_viz_pub = self.create_publisher(
             MarkerArray,
             '/assigned_targets_viz',
             10
         )
-        
+
+        # 調試信息發布
         self.debug_pub = self.create_publisher(
             String,
             '/assigner/debug',
             10
         )
-            
-        # 創建定時器
-        self.create_timer(1.0, self.assign_targets)
-        self.create_timer(0.1, self.publish_visualization)
-        self.create_timer(0.1, self.check_target_reached)
-        self.create_timer(0.1, self.check_robot_motion)  # 檢查機器人運動狀態
-        
-        self.get_logger().info('深度學習frontier分配節點已啟動')
 
-    def process_map(self, occupancy_grid):
-        """處理地圖數據為模型輸入格式"""
-        map_array = np.array(occupancy_grid)
-        map_binary = np.zeros_like(map_array, dtype=np.uint8)
-        map_binary[map_array == 0] = 255    # 已知空間
-        map_binary[map_array == 100] = 0    # 障礙物
-        map_binary[map_array == -1] = 127   # 未知空間
-        
-        resized_map = cv2.resize(map_binary, (84, 84), interpolation=cv2.INTER_LINEAR)
-        resized_map = resized_map.astype(np.float32) / 255.0
-        return np.expand_dims(resized_map, axis=-1)
+    def process_map_for_model(self, occupancy_grid):
+        """處理地圖數據為DRL模型輸入格式"""
+        if occupancy_grid is None:
+            return None
+            
+        try:
+            # 將佔用格網數據轉換為二進制圖像
+            map_array = np.array(occupancy_grid)
+            map_binary = np.zeros_like(map_array, dtype=np.uint8)
+            
+            # 地圖值映射：0=已知自由空間, 100=障礙物, -1=未知空間
+            map_binary[map_array == 0] = 255    # 已知自由空間 -> 白色
+            map_binary[map_array == 100] = 0    # 障礙物 -> 黑色  
+            map_binary[map_array == -1] = 127   # 未知空間 -> 灰色
+            
+            # 調整地圖尺寸到模型所需尺寸
+            resized_map = cv2.resize(
+                map_binary, 
+                self.map_size_for_model, 
+                interpolation=cv2.INTER_LINEAR
+            )
+            
+            # 正規化到[0,1]範圍並添加通道維度
+            normalized_map = resized_map.astype(np.float32) / 255.0
+            processed_map = np.expand_dims(normalized_map, axis=-1)
+            
+            return processed_map
+            
+        except Exception as e:
+            self.get_logger().error(f'地圖處理錯誤: {str(e)}')
+            return None
 
     def pad_frontiers(self, frontiers):
-        """填充frontier點到固定長度"""
-        padded = np.zeros((50, 2))  # max_frontiers = 50
+        """填充frontier點到固定長度並進行標準化"""
+        padded = np.zeros((self.max_frontiers, 2))
+        
         if len(frontiers) > 0:
-            normalized_frontiers = np.array(frontiers).copy()
-            normalized_frontiers[:, 0] = normalized_frontiers[:, 0] / float(self.map_width)
-            normalized_frontiers[:, 1] = normalized_frontiers[:, 1] / float(self.map_height)
+            frontiers = np.array(frontiers)
             
-            n_frontiers = min(len(frontiers), 50)
+            # 標準化座標到[0,1]範圍
+            if self.map_width and self.map_height and self.map_resolution:
+                map_width_m = self.map_width * self.map_resolution
+                map_height_m = self.map_height * self.map_resolution
+                
+                normalized_frontiers = frontiers.copy()
+                normalized_frontiers[:, 0] = (frontiers[:, 0] - self.map_origin.position.x) / map_width_m
+                normalized_frontiers[:, 1] = (frontiers[:, 1] - self.map_origin.position.y) / map_height_m
+                
+                # 確保座標在[0,1]範圍內
+                normalized_frontiers = np.clip(normalized_frontiers, 0.0, 1.0)
+            else:
+                normalized_frontiers = frontiers
+            
+            n_frontiers = min(len(frontiers), self.max_frontiers)
             padded[:n_frontiers] = normalized_frontiers[:n_frontiers]
+        
         return padded
 
     def get_normalized_position(self, pose):
         """獲取正規化後的機器人位置"""
-        return np.array([
-            pose.position.x / float(self.map_width * self.map_resolution),
-            pose.position.y / float(self.map_height * self.map_resolution)
-        ])
+        if not pose or not self.map_width or not self.map_height or not self.map_resolution:
+            return np.array([0.0, 0.0])
+            
+        map_width_m = self.map_width * self.map_resolution
+        map_height_m = self.map_height * self.map_resolution
+        
+        normalized_x = (pose.position.x - self.map_origin.position.x) / map_width_m
+        normalized_y = (pose.position.y - self.map_origin.position.y) / map_height_m
+        
+        # 確保座標在[0,1]範圍內
+        normalized_x = np.clip(normalized_x, 0.0, 1.0)
+        normalized_y = np.clip(normalized_y, 0.0, 1.0)
+        
+        return np.array([normalized_x, normalized_y])
+
+    def get_normalized_target(self, target):
+        """標準化目標位置"""
+        if target is None or not self.map_width or not self.map_height or not self.map_resolution:
+            return np.array([0.0, 0.0])
+            
+        map_width_m = self.map_width * self.map_resolution
+        map_height_m = self.map_height * self.map_resolution
+        
+        normalized_x = (target[0] - self.map_origin.position.x) / map_width_m
+        normalized_y = (target[1] - self.map_origin.position.y) / map_height_m
+        
+        # 確保座標在[0,1]範圍內
+        normalized_x = np.clip(normalized_x, 0.0, 1.0)
+        normalized_y = np.clip(normalized_y, 0.0, 1.0)
+        
+        return np.array([normalized_x, normalized_y])
 
     def map_callback(self, msg):
         """處理地圖數據"""
@@ -185,8 +314,12 @@ class DLAssigner(Node):
         self.map_width = msg.info.width
         self.map_height = msg.info.height
         self.map_origin = msg.info.origin
-        self.processed_map = self.process_map(self.map_data)
-        self.get_logger().debug('收到地圖更新')
+        
+        # 處理地圖供DRL模型使用
+        if self.use_drl:
+            self.processed_map = self.process_map_for_model(self.map_data)
+        
+        self.get_logger().debug('收到地圖更新並處理完成')
 
     def robot1_pose_callback(self, msg):
         """處理機器人1的位置更新"""
@@ -199,16 +332,15 @@ class DLAssigner(Node):
         self.get_logger().debug('收到機器人2位置更新')
 
     def filtered_points_callback(self, msg):
-        """處理過濾後的frontier點"""
+        """處理過濾後的點"""
         self.available_points = []
         if msg.markers:
             for marker in msg.markers:
                 self.available_points.extend([(p.x, p.y) for p in marker.points])
-        self.get_logger().debug(f'收到 {len(self.available_points)} 個frontier點')
+        self.get_logger().debug(f'收到 {len(self.available_points)} 個過濾後的點')
 
     def cmd_vel_callback(self, msg: Twist, robot_name: str):
         """處理速度命令消息，更新機器人速度狀態"""
-        # 計算線速度和角速度的總和
         total_velocity = abs(msg.linear.x) + abs(msg.linear.y) + abs(msg.angular.z)
         self.robot_velocities[robot_name] = total_velocity
 
@@ -218,65 +350,171 @@ class DLAssigner(Node):
             if self.robot_velocities[robot_name] is None:
                 continue
                 
-            # 檢查速度是否低於閾值
             if self.robot_velocities[robot_name] < self.velocity_check_threshold:
-                self.static_duration[robot_name] += 0.1  # 增加靜止時間計數
+                self.static_duration[robot_name] += 0.1
                 
-                # 如果靜止時間超過閾值且當前有目標，強制設置為可用狀態
                 if (self.static_duration[robot_name] >= self.static_threshold and 
-                    not self.robot_status[robot_name] and 
-                    self.assigned_targets[robot_name] is not None):
-                    self.get_logger().info(f'{robot_name} 已靜止 {self.static_threshold} 秒，強制重新分配目標')
+                    not self.robot_status[robot_name]):
+                    self.get_logger().info(f'{robot_name} 已靜止 {self.static_threshold} 秒，標記為可用狀態')
                     self.robot_status[robot_name] = True
                     self.assigned_targets[robot_name] = None
-                    self.static_duration[robot_name] = 0.0  # 重置靜止時間
             else:
-                # 如果有運動，重置靜止時間計數
                 self.static_duration[robot_name] = 0.0
 
-    def predict_best_frontier(self, robot_name):
-        """使用神經網路預測最佳frontier點"""
-        if not self.available_points:
-            return None
-            
-        state = np.expand_dims(self.processed_map, 0)
-        frontiers = np.expand_dims(self.pad_frontiers(self.available_points), 0)
-        
-        robot_pose = self.robot1_pose if robot_name == 'robot1' else self.robot2_pose
-        robot_pos = np.expand_dims(self.get_normalized_position(robot_pose), 0)
-        
-        q_values = self.model.predict(state, frontiers, robot_pos)[0]
-        valid_q = q_values[:len(self.available_points)]
-        best_idx = np.argmax(valid_q)
-        
-        return self.available_points[best_idx]
-
     def check_target_reached(self):
-        """检查機器人是否到達目標點"""
-        for robot_name, robot_pose in [('robot1', self.robot1_pose), ('robot2', self.robot2_pose)]:
+        """檢查機器人是否到達目標點"""
+        robots = {
+            'robot1': self.robot1_pose,
+            'robot2': self.robot2_pose
+        }
+
+        for robot_name, robot_pose in robots.items():
             if not robot_pose or not self.assigned_targets[robot_name]:
                 continue
 
+            target = self.assigned_targets[robot_name]
             current_pos = (robot_pose.position.x, robot_pose.position.y)
-            target_pos = self.assigned_targets[robot_name]
+            target_pos = target
+
             distance = np.sqrt(
                 (current_pos[0] - target_pos[0])**2 + 
                 (current_pos[1] - target_pos[1])**2
             )
 
-            # 如果距離小於值閥值，認為已經達到目標
             if distance < self.target_threshold:
                 if not self.robot_status[robot_name]:
                     self.get_logger().info(f'{robot_name} 已到達目標點 {target_pos}')
                 self.robot_status[robot_name] = True
                 self.assigned_targets[robot_name] = None
-                
-                # 重新分配
-                self.assign_targets()
             else:
                 self.robot_status[robot_name] = False
 
-    def create_target_marker(self, point, robot_name, marker_id):
+    def calculate_distance(self, point1, point2):
+        """計算兩點之間的歐幾里德距離"""
+        return np.sqrt((point1[0] - point2[0])**2 + (point1[1] - point2[1])**2)
+
+    def calculate_utility_score(self, robot_pose, target_point, other_robot_pose=None, other_target=None):
+        """計算目標點的效用分數（距離基礎的智能分配）"""
+        if not robot_pose:
+            return float('inf')
+        
+        robot_pos = (robot_pose.position.x, robot_pose.position.y)
+        
+        # 基礎距離分數（距離越近分數越高）
+        distance = self.calculate_distance(robot_pos, target_point)
+        distance_score = 1.0 / (1.0 + distance)
+        
+        # 避免衝突分數
+        conflict_penalty = 0.0
+        if other_robot_pose and other_target:
+            other_pos = (other_robot_pose.position.x, other_robot_pose.position.y)
+            
+            # 如果另一個機器人更接近這個目標，給予懲罰
+            other_distance = self.calculate_distance(other_pos, target_point)
+            if other_distance < distance:
+                conflict_penalty = 0.5
+            
+            # 如果目標點太接近另一個機器人的目標，給予懲罰
+            if other_target:
+                target_distance = self.calculate_distance(target_point, other_target)
+                if target_distance < 2.0:  # 2米內視為太接近
+                    conflict_penalty += 0.3
+        
+        # 綜合分數
+        final_score = distance_score - conflict_penalty
+        return final_score
+
+    def distance_based_assignment(self, robot_name, available_points, assigned_points):
+        """基於距離和效用的智能分配方法"""
+        robot_pose = self.robot1_pose if robot_name == 'robot1' else self.robot2_pose
+        other_robot_pose = self.robot2_pose if robot_name == 'robot1' else self.robot1_pose
+        other_robot_name = 'robot2' if robot_name == 'robot1' else 'robot1'
+        other_target = self.assigned_targets.get(other_robot_name)
+        
+        if not robot_pose:
+            return None
+            
+        valid_targets = []
+        MIN_DISTANCE = 0.5  # 最小距離要求
+        
+        for point in available_points:
+            if tuple(point) in assigned_points:
+                continue
+                
+            distance = self.calculate_distance(
+                (robot_pose.position.x, robot_pose.position.y), 
+                point
+            )
+            
+            if distance >= MIN_DISTANCE:
+                # 計算效用分數
+                utility_score = self.calculate_utility_score(
+                    robot_pose, point, other_robot_pose, other_target
+                )
+                valid_targets.append((point, utility_score, distance))
+        
+        if valid_targets:
+            # 選擇效用分數最高的點
+            best_target = max(valid_targets, key=lambda x: x[1])
+            self.get_logger().debug(
+                f'{robot_name} 選擇目標: {best_target[0]}, '
+                f'效用分數: {best_target[1]:.3f}, 距離: {best_target[2]:.2f}m'
+            )
+            return best_target[0]
+            
+        return None
+
+    def predict_best_frontier_with_drl(self, robot_name):
+        """使用DRL模型預測最佳frontier點"""
+        if (not self.use_drl or 
+            self.drl_model is None or 
+            self.processed_map is None or 
+            len(self.available_points) == 0):
+            return None
+            
+        try:
+            # 準備輸入數據
+            state = np.expand_dims(self.processed_map, 0)  # 添加batch維度
+            frontiers = np.expand_dims(self.pad_frontiers(self.available_points), 0)
+            
+            # 獲取機器人位置
+            robot1_pos = self.get_normalized_position(self.robot1_pose)
+            robot2_pos = self.get_normalized_position(self.robot2_pose)
+            robot1_pos_batch = np.expand_dims(robot1_pos, 0)
+            robot2_pos_batch = np.expand_dims(robot2_pos, 0)
+            
+            # 獲取當前目標位置
+            robot1_target = self.get_normalized_target(self.assigned_targets.get('robot1'))
+            robot2_target = self.get_normalized_target(self.assigned_targets.get('robot2'))
+            robot1_target_batch = np.expand_dims(robot1_target, 0)
+            robot2_target_batch = np.expand_dims(robot2_target, 0)
+            
+            # 使用DRL模型進行預測
+            predictions = self.drl_model.predict(
+                state, frontiers,
+                robot1_pos_batch, robot2_pos_batch,
+                robot1_target_batch, robot2_target_batch
+            )
+            
+            # 提取對應機器人的Q值
+            valid_frontiers = min(self.max_frontiers, len(self.available_points))
+            if robot_name == 'robot1':
+                q_values = predictions['robot1'][0, :valid_frontiers]
+            else:
+                q_values = predictions['robot2'][0, :valid_frontiers]
+            
+            # 選擇Q值最高的動作
+            best_action = np.argmax(q_values)
+            best_frontier = self.available_points[best_action]
+            
+            self.get_logger().debug(f'DRL模型為 {robot_name} 選擇的frontier: {best_frontier}')
+            return best_frontier
+            
+        except Exception as e:
+            self.get_logger().error(f'DRL預測錯誤: {str(e)}')
+            return None
+
+    def create_target_marker(self, point: Tuple[float, float], robot_name: str, marker_id: int) -> Marker:
         """創建目標點標記"""
         marker = Marker()
         marker.header.frame_id = "merge_map"
@@ -291,15 +529,15 @@ class DLAssigner(Node):
         marker.pose.position.z = 0.0
         marker.pose.orientation.w = 1.0
         
-        marker.scale.x = marker.scale.y = marker.scale.z = 0.5
+        marker.scale.x = 0.5
+        marker.scale.y = 0.5
+        marker.scale.z = 0.5
         
-        marker.color = ColorRGBA(
-            r=1.0 if robot_name == 'robot1' else 0.0,
-            g=0.0 if robot_name == 'robot1' else 1.0,
-            b=0.0,
-            a=0.8
-        )
-        
+        if robot_name == 'robot1':
+            marker.color = ColorRGBA(r=1.0, g=0.0, b=0.0, a=0.8)
+        else:
+            marker.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=0.8)
+            
         return marker
 
     def publish_visualization(self):
@@ -319,111 +557,109 @@ class DLAssigner(Node):
         self.target_viz_pub.publish(marker_array)
 
     def assign_targets(self):
-        """分配目標給機器人"""
-        if (len(self.available_points) == 0 or 
-            self.processed_map is None or
+        """分配目標給機器人 - 主要邏輯"""
+        if (not self.available_points or 
             self.robot1_pose is None or 
             self.robot2_pose is None):
             return
 
-        # 獲取已分配的點
+        # 記錄已分配的點
         assigned_points = set()
+        for robot, target in self.assigned_targets.items():
+            if target is not None:
+                assigned_points.add(tuple(target))
+
         for robot_name in ['robot1', 'robot2']:
-            if self.assigned_targets[robot_name] is not None:
-                assigned_points.add(tuple(self.assigned_targets[robot_name]))
-
-        # 移除與已分配的點太近的點
-        available_points = []
-        for point in self.available_points:
-            too_close = False
-            for assigned_point in assigned_points:
-                dist = np.sqrt(
-                    (point[0] - assigned_point[0])**2 + 
-                    (point[1] - assigned_point[1])**2
-                )
-                if dist < 0.5:  
-                    too_close = True
-                    break
-            if not too_close:
-                available_points.append(point)
-
-        if not available_points:
-            return
-
-        # 對每一台機器人進行目標分配
-        for robot_name in ['robot1', 'robot2']:
-            
+            # 只在機器人可用且沒有當前目標時分配新目標
             if not self.robot_status[robot_name] or self.assigned_targets[robot_name] is not None:
                 continue
 
-            # 對剩餘的點進行評估
-            valid_points = []
-            for point in available_points:
-                if tuple(point) in assigned_points:
-                    continue
-
-                # 計算距離
-                robot_pose = self.robot1_pose if robot_name == 'robot1' else self.robot2_pose
-                dist = np.sqrt(
-                    (point[0] - robot_pose.position.x)**2 + 
-                    (point[1] - robot_pose.position.y)**2
-                )
-                
-                # 如果距離太近就跳過
-                if dist < 1.0:  
-                    continue
-
-                # 使用訓練的模型
-                state = np.expand_dims(self.processed_map, 0)
-                frontiers = np.expand_dims(self.pad_frontiers(available_points), 0)
-                robot_pos = np.expand_dims(self.get_normalized_position(robot_pose), 0)
-                q_values = self.model.predict(state, frontiers, robot_pos)[0]
-                valid_points.append((point, q_values[available_points.index(point)]))
-
-            if valid_points:
-                # Q值最高的點
-                best_point = max(valid_points, key=lambda x: x[1])[0]
-                self.assigned_targets[robot_name] = best_point
-                assigned_points.add(tuple(best_point))
-
-                # 發布目標點
-                target_pose = PoseStamped()
-                target_pose.header.frame_id = 'merge_map'
-                target_pose.header.stamp = self.get_clock().now().to_msg()
-                target_pose.pose.position.x = best_point[0]
-                target_pose.pose.position.y = best_point[1]
-                target_pose.pose.orientation.w = 1.0
-
-                # 根據機器人選擇發布給誰
-                if robot_name == 'robot1':
-                    self.robot1_target_pub.publish(target_pose)
-                else:
-                    self.robot2_target_pub.publish(target_pose)
-
+            # 過濾掉已分配的點
+            available_points = [
+                point for point in self.available_points 
+                if tuple(point) not in assigned_points
+            ]
             
-                debug_msg = String()
-                debug_msg.data = f'已將frontier點 {best_point} 分配给 {robot_name}'
-                self.debug_pub.publish(debug_msg)
-                self.get_logger().info(debug_msg.data)
+            if not available_points:
+                continue
+
+            # 首先嘗試使用DRL模型（如果啟用且可用）
+            best_point = None
+            method_used = "距離基礎"
+            
+            if self.use_drl and self.drl_model:
+                best_point = self.predict_best_frontier_with_drl(robot_name)
+                if best_point:
+                    method_used = "DRL模型"
+            
+            # 如果DRL模型失敗或未啟用，使用智能距離基礎方法
+            if best_point is None:
+                best_point = self.distance_based_assignment(robot_name, available_points, assigned_points)
+            
+            if best_point is not None:
+                # 確保選擇的點還沒有被分配
+                if tuple(best_point) not in assigned_points:
+                    assigned_points.add(tuple(best_point))
+                    self.assigned_targets[robot_name] = best_point
+
+                    # 創建並發布目標點消息
+                    target_pose = PoseStamped()
+                    target_pose.header.frame_id = 'merge_map'
+                    target_pose.header.stamp = self.get_clock().now().to_msg()
+                    target_pose.pose.position.x = best_point[0]
+                    target_pose.pose.position.y = best_point[1]
+                    target_pose.pose.orientation.w = 1.0
+
+                    # 根據機器人選擇對應的發布者
+                    if robot_name == 'robot1':
+                        self.robot1_target_pub.publish(target_pose)
+                    else:
+                        self.robot2_target_pub.publish(target_pose)
+
+                    # 發布調試信息
+                    debug_msg = String()
+                    debug_msg.data = f'已將目標點 {best_point} 分配給 {robot_name} (使用{method_used})'
+                    self.debug_pub.publish(debug_msg)
+                    self.get_logger().info(debug_msg.data)
+            else:
+                self.get_logger().warn(f'未找到 {robot_name} 的有效目標')
 
 def main(args=None):
+    """主函數"""
     rclpy.init(args=args)
     
-    gpus = tf.config.experimental.list_physical_devices('GPU')
-    if gpus:
-        try:
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-        except RuntimeError as e:
-            print(f'GPU配置錯誤: {e}')
+    # 配置TensorFlow GPU設置（如果有GPU）
+    try:
+        gpus = tf.config.experimental.list_physical_devices('GPU')
+        if gpus:
+            try:
+                for gpu in gpus:
+                    tf.config.experimental.set_memory_growth(gpu, True)
+                print(f'找到 {len(gpus)} 個 GPU 設備，已啟用記憶體增長')
+            except RuntimeError as e:
+                print(f'GPU配置錯誤: {e}')
+        else:
+            print('未找到 GPU 設備，使用 CPU 運行')
+    except Exception as e:
+        print(f'TensorFlow 配置錯誤: {e}')
     
     try:
-        node = DLAssigner()
+        node = DRLAssigner()
         rclpy.spin(node)
     except KeyboardInterrupt:
-        pass
+        print("收到中斷信號，正在關閉...")
+    except Exception as e:
+        print(f'錯誤: {str(e)}')
     finally:
-        rclpy.shutdown()
+        if 'node' in locals():
+            try:
+                node.destroy_node()
+            except:
+                pass
+        try:
+            rclpy.shutdown()
+        except:
+            pass
 
 if __name__ == '__main__':
     main()

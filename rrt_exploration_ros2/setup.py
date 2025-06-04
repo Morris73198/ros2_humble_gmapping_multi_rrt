@@ -35,6 +35,8 @@ setup(
             'filter_node = rrt_exploration_ros2.filter_node:main',
             'assigner = rrt_exploration_ros2.assigner:main',
             'test_assigner = rrt_exploration_ros2.test_assigner:main',
+            'ta2 = rrt_exploration_ros2.ta2:main',
+
         ],
     },
 )
