@@ -12,13 +12,10 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        # 添加launch文件安装
-        ('share/' + package_name + '/launch', glob('launch/*.py')),
-        # 如果有config文件也添加
-        ('share/' + package_name + '/config', glob('config/*.yaml')),
-        # 如果有其他资源文件
+        ('share/' + package_name + '/launch',
+            glob('launch/*.launch.py')),  # 添加launch檔案
         ('share/' + package_name + '/saved_models',
-            glob('rrt_exploration_ros2/saved_models/*.h5')),
+            glob('rrt_exploration_ros2/saved_models/*.h5')),  # 添加模型文件
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -35,8 +32,7 @@ setup(
             'filter_node = rrt_exploration_ros2.filter_node:main',
             'assigner = rrt_exploration_ros2.assigner:main',
             'test_assigner = rrt_exploration_ros2.test_assigner:main',
-            'ta2 = rrt_exploration_ros2.ta2:main',
-
+            'grid_frontier_detector = rrt_exploration_ros2.grid_frontier_detector:main',  # 添加這一行
         ],
     },
 )

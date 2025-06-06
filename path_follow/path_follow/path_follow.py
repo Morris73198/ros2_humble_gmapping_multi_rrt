@@ -32,26 +32,14 @@ class PathFollower(Node):
     def __init__(self):
         super().__init__('path_follower')
         
-        # 获取节点的namespace来确定机器人身份
-        self.robot_namespace = self.get_namespace()
-        if 'robot1' in self.robot_namespace:
-            self.robot_name = 'robot1'
-            self.other_robot = 'robot2'
-        elif 'robot2' in self.robot_namespace:
-            self.robot_name = 'robot2'
-            self.other_robot = 'robot1'
-        else:
-            self.robot_name = 'robot1'  # 默认
-            self.other_robot = 'robot2'
-        
-        # Publishers (保持原有的topic)
+        # Publishers
         self.publisher_visual_path = self.create_publisher(Path, 'visual_path', 10)
         self.publisher_cmd_vel = self.create_publisher(Twist, 'cmd_vel', 10)
         self.publisher_markers = self.create_publisher(MarkerArray, 'segment_markers', 10)
         self.publisher_current_goal = self.create_publisher(Marker, 'current_goal_marker', 10)
         self.publisher_apf_forces = self.create_publisher(Marker, 'apf_forces', 10)
         
-        # Subscribers (保持原有的topic)
+        # Subscribers
         self.subscription_path = self.create_subscription(
             Float32MultiArray,
             'path',
@@ -69,30 +57,20 @@ class PathFollower(Node):
             'scan',
             self.scan_callback,
             qos_profile_sensor_data)
-        
-        # 新增：订阅另一台机器人的位置 (新增功能)
-        self.other_robot_pose = None
-        self.subscription_other_robot = self.create_subscription(
-            PoseStamped,
-            f'/{self.other_robot}_pose',
-            self.other_robot_callback,
-            10)
             
-        # APF parameters (保持原有参数，添加新的机器人相关参数)
+        # APF parameters
         self.Eta_att = 110  
         self.Eta_rep_ob = 3  
-        self.Eta_rep_robot = 15  # 新增：机器人间斥力系数
         self.n = 3  
         self.obstacle_distance_threshold = 0.5
-        self.robot_distance_threshold = 1.2  # 新增：机器人间安全距离
         self.front_angle_range = 2 * math.pi
         self.segment_distance = 0.5
         
-        # Speed limits (保持原有)
+        # Speed limits
         self.speedTH = 0.15
         self.thetaTH = 0.65
         
-        # Initialize states (保持原有)
+        # Initialize states
         self.position = [0, 0, 0]
         self.euler = [0, 0, 0]
         self.path = None
@@ -100,11 +78,11 @@ class PathFollower(Node):
         self.current_goal_index = 0
         self.following_path = False
         
-        # Path following thread control (保持原有)
+        # Path following thread control
         self.follow_thread = None
         self.path_follow_lock = threading.Lock()
         
-        # Initialize LiDAR (保持原有)
+        # Initialize LiDAR
         self.angle_min = 0
         self.angle_max = 0
         self.angle_increment = 0
@@ -113,11 +91,7 @@ class PathFollower(Node):
         self.front_min_angle = 2*math.pi - self.front_angle_range/2
         self.front_max_angle = self.front_angle_range/2
         
-        self.get_logger().info(f"Path follower node has been started for {self.robot_name}")
-
-    def other_robot_callback(self, msg):
-        """新增：接收另一台机器人的位置信息"""
-        self.other_robot_pose = msg.pose
+        self.get_logger().info("Path follower node has been started")
 
     def stop_robot(self):
         twist = Twist()
@@ -259,14 +233,19 @@ class PathFollower(Node):
             self.path = [(data_list[i], data_list[i+1]) 
                         for i in range(0, len(data_list), 2)]
             
+            
             # Create segment markers
             if len(self.path) > 0:
                 marker_array = self.create_segment_markers(self.path)
                 self.publisher_markers.publish(marker_array)
                 
+                
             self.path = self.segment_path(self.path)    
             self.current_goal_index = 0
             self.current_goal = self.path[0]
+            
+            
+            
             
             self.following_path = True
             self.follow_thread = threading.Thread(target=self.follow_path)
@@ -290,38 +269,11 @@ class PathFollower(Node):
         self.angle_increment = msg.angle_increment
         self.ranges = msg.ranges
 
-    def calculate_robot_repulsive_force(self):
-        """新增：计算来自另一台机器人的斥力"""
-        if not self.other_robot_pose:
-            return 0, 0
-        
-        # 计算与另一台机器人的距离
-        other_pos = [self.other_robot_pose.position.x, self.other_robot_pose.position.y]
-        dx = self.position[0] - other_pos[0]
-        dy = self.position[1] - other_pos[1]
-        distance = math.sqrt(dx**2 + dy**2)
-        
-        if distance < self.robot_distance_threshold and distance > 0:
-            # 计算斥力大小
-            force_magnitude = self.Eta_rep_robot * (1/distance - 1/self.robot_distance_threshold) / (distance**2)
-            
-            # 归一化方向向量
-            unit_vector_x = dx / distance
-            unit_vector_y = dy / distance
-            
-            # 返回斥力分量
-            F_rep_x = force_magnitude * unit_vector_x
-            F_rep_y = force_magnitude * unit_vector_y
-            
-            return F_rep_x, F_rep_y
-        
-        return 0, 0
-
     def calculate_apf_forces(self):
         if not self.current_goal:
             return 0, 0
             
-        # Attractive force toward goal (保持原有逻辑)
+        # Attractive force toward goal
         Ptogoal = [
             self.current_goal[0] - self.position[0],
             self.current_goal[1] - self.position[1]
@@ -332,8 +284,8 @@ class PathFollower(Node):
             self.Eta_att * distance_to_goal * Ptogoal[1]/distance_to_goal
         ]
         
-        # Repulsive force from obstacles (保持原有逻辑)
-        F_rep_obstacles = [0, 0]
+        # Repulsive force from obstacles
+        F_rep = [0, 0]
         if len(self.ranges) > 0:
             angles = self.angle_min + np.arange(len(self.ranges)) * self.angle_increment
             front_indices = np.where(
@@ -352,22 +304,19 @@ class PathFollower(Node):
                         self.ranges[idx]**2
                     )
                     
-                    F_rep_obstacles[0] += F_rep_ob1_abs * (-math.cos(obs_angle))
-                    F_rep_obstacles[1] += F_rep_ob1_abs * (-math.sin(obs_angle))
+                    F_rep[0] += F_rep_ob1_abs * (-math.cos(obs_angle))
+                    F_rep[1] += F_rep_ob1_abs * (-math.sin(obs_angle))
         
-        # 新增：计算来自另一台机器人的斥力
-        F_rep_robot_x, F_rep_robot_y = self.calculate_robot_repulsive_force()
-        
-        # Sum all forces and normalize (修改：包含机器人斥力)
-        F_sum = [
-            F_att[0] + F_rep_obstacles[0] + F_rep_robot_x, 
-            F_att[1] + F_rep_obstacles[1] + F_rep_robot_y
-        ]
+        # Sum forces and normalize
+        F_sum = [F_att[0] + F_rep[0], F_att[1] + F_rep[1]]
         F_magnitude = np.linalg.norm(F_sum)
         
         if F_magnitude > 0:
             UniVec_Fsum = [f / F_magnitude for f in F_sum]
             return UniVec_Fsum[0], UniVec_Fsum[1]
+            
+        return 0, 0
+
     def follow_path(self):
         """Main path following logic"""
         twist = Twist()
