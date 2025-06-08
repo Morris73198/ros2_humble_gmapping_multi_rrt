@@ -12,7 +12,7 @@ import socket
 import json
 
 def send_state_and_get_target(state, host='127.0.0.1', port=9000):
-    """發送狀態並接收目標，增強錯誤處理"""
+    """Send state and receive target with enhanced error handling"""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(5.0)
@@ -36,42 +36,42 @@ def send_state_and_get_target(state, host='127.0.0.1', port=9000):
         s.close()
         return target
     except Exception as e:
-        print(f"Socket通訊錯誤: {e}")
+        print(f"Socket communication error: {e}")
         if 's' in locals():
             s.close()
         return {"target_point": None, "error": str(e)}
 
-class ImprovedSocketAssigner(Node):
+class TestSocketAssigner(Node):
     def __init__(self):
-        super().__init__('improved_socket_assigner')
+        super().__init__('test_socket_assigner')
 
-        # 基本狀態
+        # Basic state
         self.robot1_pose = None
         self.robot2_pose = None
         self.available_points = []
         self.assigned_targets = {'robot1': None, 'robot2': None}
         
-        # 改進的運動檢測
+        # Motion detection
         self.robot_last_pose = {'robot1': None, 'robot2': None}
-        self.robot_cmd_vel = {'robot1': None, 'robot2': None}  # 記錄命令速度
+        self.robot_cmd_vel = {'robot1': None, 'robot2': None}
         self.robot_last_cmd_time = {'robot1': self.get_clock().now(), 'robot2': self.get_clock().now()}
         self.robot_last_move_time = {'robot1': self.get_clock().now(), 'robot2': self.get_clock().now()}
         self.robot_static_time = {'robot1': 0.0, 'robot2': 0.0}
         
-        # 核心：目標鎖定機制
+        # Target locking mechanism
         self.target_locked = {'robot1': False, 'robot2': False}
         self.target_assignment_time = {'robot1': None, 'robot2': None}
         
-        # 改進的參數設定
-        self.static_threshold = 15.0  # 增加到15秒
-        self.movement_threshold = 0.1  # 降低移動閾值
+        # Parameters
+        self.static_threshold = 15.0
+        self.movement_threshold = 0.1
         self.target_threshold = 0.8
         self.exclusion_radius = 2.0
         self.min_target_distance = 1.5
-        self.cmd_vel_threshold = 0.05  # 命令速度閾值
-        self.no_cmd_timeout = 5.0  # 沒有命令速度超時時間
+        self.cmd_vel_threshold = 0.05
+        self.no_cmd_timeout = 5.0
         
-        # 地圖相關
+        # Map related
         self.map_data = None
         self.map_resolution = None
         self.map_width = None
@@ -80,21 +80,21 @@ class ImprovedSocketAssigner(Node):
         self.processed_map = None
         self.max_frontiers = 50
 
-        # ROS2 通訊
+        # ROS2 communication
         self.setup_subscribers()
         self.setup_publishers()
 
-        # 定時器 - 調整頻率
+        # Timers
         self.create_timer(8.0, self.assign_targets)
-        self.create_timer(2.0, self.check_robot_status)  # 增加檢查頻率
+        self.create_timer(2.0, self.check_robot_status)
         self.create_timer(0.2, self.publish_visualization)
         self.create_timer(5.0, self.publish_debug_info)
 
-        self.get_logger().warning('🔧 Improved Socket Assigner - 改進運動檢測')
-        self.get_logger().warning(f'⏰ 靜止閾值: {self.static_threshold}秒')
+        self.get_logger().info('Test Socket Assigner started')
+        self.get_logger().info(f'Static threshold: {self.static_threshold} seconds')
 
     def setup_subscribers(self):
-        # 基本訂閱
+        # Basic subscriptions
         self.map_sub = self.create_subscription(
             OccupancyGrid, '/merge_map', self.map_callback, 10)
         self.robot1_pose_sub = self.create_subscription(
@@ -104,7 +104,7 @@ class ImprovedSocketAssigner(Node):
         self.filtered_points_sub = self.create_subscription(
             MarkerArray, '/filtered_points', self.filtered_points_callback, 10)
 
-        # 新增：訂閱命令速度
+        # Subscribe to command velocities
         self.robot1_cmd_vel_sub = self.create_subscription(
             Twist, '/robot1/cmd_vel', 
             lambda msg: self.cmd_vel_callback(msg, 'robot1'), 10)
@@ -123,18 +123,18 @@ class ImprovedSocketAssigner(Node):
             String, '/assigner/debug', 10)
 
     def cmd_vel_callback(self, msg, robot_name):
-        """記錄機器人命令速度"""
+        """Record robot command velocity"""
         total_cmd_vel = abs(msg.linear.x) + abs(msg.linear.y) + abs(msg.angular.z)
         self.robot_cmd_vel[robot_name] = total_cmd_vel
         self.robot_last_cmd_time[robot_name] = self.get_clock().now()
         
-        # 如果有命令速度，重置靜止時間
+        # Reset static time if command velocity is present
         if total_cmd_vel > self.cmd_vel_threshold:
             self.robot_static_time[robot_name] = 0.0
             self.robot_last_move_time[robot_name] = self.get_clock().now()
 
     def map_callback(self, msg):
-        """地圖回調"""
+        """Map callback"""
         try:
             self.map_data = np.array(msg.data).reshape((msg.info.height, msg.info.width))
             self.map_resolution = msg.info.resolution
@@ -153,7 +153,7 @@ class ImprovedSocketAssigner(Node):
             self.processed_map = np.expand_dims(normalized_map, axis=-1)
             
         except Exception as e:
-            self.get_logger().error(f'地圖處理錯誤: {e}')
+            self.get_logger().error(f'Map processing error: {e}')
             self.processed_map = None
 
     def robot1_pose_callback(self, msg):
@@ -170,24 +170,24 @@ class ImprovedSocketAssigner(Node):
                 self.available_points.extend([(p.x, p.y) for p in marker.points])
         
         if len(self.available_points) != old_count:
-            self.get_logger().info(f'更新frontier點: {old_count} -> {len(self.available_points)}')
+            self.get_logger().info(f'Updated frontier points: {old_count} -> {len(self.available_points)}')
 
     def is_robot_actually_moving(self, robot_name):
-        """改進的運動檢測邏輯"""
+        """Improved motion detection logic"""
         current_time = self.get_clock().now()
         
-        # 1. 檢查是否有命令速度
+        # Check if there is command velocity
         if self.robot_cmd_vel[robot_name] is not None:
-            # 檢查命令速度是否足夠大
+            # Check if command velocity is sufficient
             if self.robot_cmd_vel[robot_name] > self.cmd_vel_threshold:
-                return True, "有足夠的命令速度"
+                return True, "Sufficient command velocity"
             
-            # 檢查是否長時間沒有命令速度
+            # Check if no command velocity for too long
             time_since_cmd = (current_time - self.robot_last_cmd_time[robot_name]).nanoseconds / 1e9
             if time_since_cmd > self.no_cmd_timeout:
-                return False, f"超過{self.no_cmd_timeout}秒沒有命令速度"
+                return False, f"No command velocity for {self.no_cmd_timeout} seconds"
         
-        # 2. 檢查位置變化
+        # Check position change
         current_pose = getattr(self, f'{robot_name}_pose')
         if current_pose and self.robot_last_pose[robot_name]:
             current_pos = [current_pose.position.x, current_pose.position.y]
@@ -202,14 +202,14 @@ class ImprovedSocketAssigner(Node):
             )
             
             if movement_distance > self.movement_threshold:
-                return True, f"位置變化 {movement_distance:.3f}m"
+                return True, f"Position change {movement_distance:.3f}m"
             else:
-                return False, f"位置變化太小 {movement_distance:.3f}m"
+                return False, f"Position change too small {movement_distance:.3f}m"
         
-        return False, "無法判斷"
+        return False, "Cannot determine"
 
     def check_robot_status(self):
-        """改進的機器人狀態檢查"""
+        """Improved robot status check"""
         current_time = self.get_clock().now()
         
         robots = {
@@ -223,7 +223,7 @@ class ImprovedSocketAssigner(Node):
                 
             current_pos = [current_pose.position.x, current_pose.position.y]
             
-            # 檢查1：是否到達目標
+            # Check if reached target
             if self.assigned_targets[robot_name] is not None and self.target_locked[robot_name]:
                 target_pos = self.assigned_targets[robot_name]
                 distance_to_target = np.sqrt(
@@ -232,39 +232,39 @@ class ImprovedSocketAssigner(Node):
                 )
                 
                 if distance_to_target < self.target_threshold:
-                    self.get_logger().warning(f'🎯 {robot_name} 已到達目標點，解除鎖定並允許重新分配')
+                    self.get_logger().info(f'{robot_name} reached target, unlocking and allowing reassignment')
                     self._clear_robot_target(robot_name, current_time)
                     continue
             
-            # 檢查2：改進的運動檢測
+            # Check motion
             is_moving, reason = self.is_robot_actually_moving(robot_name)
             
             if is_moving:
-                # 機器人正在移動
+                # Robot is moving
                 self.robot_static_time[robot_name] = 0.0
                 self.robot_last_move_time[robot_name] = current_time
-                self.get_logger().debug(f'{robot_name} 正在移動: {reason}')
+                self.get_logger().debug(f'{robot_name} is moving: {reason}')
             else:
-                # 機器人沒有移動，累積靜止時間
+                # Robot is not moving, accumulate static time
                 time_diff = (current_time - self.robot_last_move_time[robot_name]).nanoseconds / 1e9
                 self.robot_static_time[robot_name] = time_diff
                 
-                # 只有靜止太久才強制解除鎖定
+                # Force unlock only if static for too long
                 if (self.robot_static_time[robot_name] > self.static_threshold and 
                     self.assigned_targets[robot_name] is not None and 
                     self.target_locked[robot_name]):
                     
-                    self.get_logger().error(
-                        f'🚨 {robot_name} 靜止 {self.robot_static_time[robot_name]:.1f}秒 '
-                        f'(原因: {reason})，強制解除鎖定'
+                    self.get_logger().warn(
+                        f'{robot_name} static for {self.robot_static_time[robot_name]:.1f}s '
+                        f'(reason: {reason}), force unlock'
                     )
                     self._clear_robot_target(robot_name, current_time)
             
-            # 更新上次位置
+            # Update last position
             self.robot_last_pose[robot_name] = current_pose
 
     def _clear_robot_target(self, robot_name, current_time):
-        """清除機器人目標"""
+        """Clear robot target"""
         self.assigned_targets[robot_name] = None
         self.target_locked[robot_name] = False
         self.target_assignment_time[robot_name] = None
@@ -272,7 +272,7 @@ class ImprovedSocketAssigner(Node):
         self.robot_last_move_time[robot_name] = current_time
 
     def is_point_too_close_to_other_target(self, point, robot_name):
-        """檢查點是否太接近其他機器人的目標點"""
+        """Check if point is too close to other robot's target"""
         other_robot = 'robot2' if robot_name == 'robot1' else 'robot1'
         other_target = self.assigned_targets[other_robot]
         
@@ -287,7 +287,7 @@ class ImprovedSocketAssigner(Node):
         return distance < self.min_target_distance
 
     def filter_excluded_points(self, points, robot_name):
-        """過濾掉被其他機器人排除的點"""
+        """Filter out points excluded by other robots"""
         other_robot = 'robot2' if robot_name == 'robot1' else 'robot1'
         other_target = self.assigned_targets[other_robot]
         
@@ -307,90 +307,93 @@ class ImprovedSocketAssigner(Node):
         return filtered_points
 
     def assign_targets(self):
-        """智能分配目標 - 改進邏輯"""
+        """Smart target assignment"""
         if not self.available_points:
-            self.get_logger().debug('沒有可用的frontier點')
+            self.get_logger().debug('No available frontier points')
             return
             
         if self.robot1_pose is None or self.robot2_pose is None:
-            self.get_logger().debug('機器人位置資訊不完整')
+            self.get_logger().debug('Robot position information incomplete')
             return
             
         if self.processed_map is None:
-            self.get_logger().debug('地圖資料未處理完成')
+            self.get_logger().debug('Map data not processed')
             return
 
-        # 檢查哪些機器人需要新目標
+        # Check which robots need new targets
         need_assignment = []
         current_time = self.get_clock().now()
         
         for robot_name in ['robot1', 'robot2']:
-            # 絕對鎖定邏輯：如果目標已鎖定，絕對不重新分配
+            # Absolute lock logic: if target is locked, never reassign
             if self.target_locked[robot_name]:
                 target = self.assigned_targets[robot_name]
                 time_locked = (current_time - self.target_assignment_time[robot_name]).nanoseconds / 1e9
                 self.get_logger().debug(
-                    f'🔒 {robot_name} 目標已鎖定 {target} (鎖定 {time_locked:.1f}秒)，絕對不重新分配'
+                    f'{robot_name} target locked {target} (locked for {time_locked:.1f}s), never reassign'
                 )
                 continue
             
             if self.assigned_targets[robot_name] is None and not self.target_locked[robot_name]:
                 need_assignment.append(robot_name)
-                self.get_logger().info(f'✅ {robot_name} 沒有鎖定目標，可以分配')
+                self.get_logger().info(f'{robot_name} has no locked target, can assign')
 
         if not need_assignment:
             return
 
-        self.get_logger().info(f'需要分配目標: {need_assignment}, 可用frontier: {len(self.available_points)}')
+        self.get_logger().info(f'Need assignment: {need_assignment}, available frontier: {len(self.available_points)}')
 
-        # 為每個需要分配的機器人處理
+        # Process each robot needing assignment
         for robot_name in need_assignment:
             filtered_points = self.filter_excluded_points(self.available_points, robot_name)
             
             if not filtered_points:
-                self.get_logger().warning(f'{robot_name} 沒有可用的frontier點（都被其他機器人排除）')
+                self.get_logger().warning(f'{robot_name} has no available frontier points (all excluded by other robots)')
                 continue
 
-            # 組成狀態字典
+            # Compose state dictionary - Fixed: add robot_target
             state = {
                 "map": self.processed_map.tolist(),
                 "frontiers": filtered_points,
                 "robot1_pose": [self.robot1_pose.position.x, self.robot1_pose.position.y],
                 "robot2_pose": [self.robot2_pose.position.x, self.robot2_pose.position.y],
+                # Add current robot targets
+                "robot1_target": self.assigned_targets['robot1'] if self.assigned_targets['robot1'] else [0.0, 0.0],
+                "robot2_target": self.assigned_targets['robot2'] if self.assigned_targets['robot2'] else [0.0, 0.0],
                 "request_robot": robot_name
             }
 
             try:
-                self.get_logger().info(f'向RL服務器為 {robot_name} 請求目標分配...')
+                self.get_logger().info(f'Requesting target assignment for {robot_name} from RL server...')
                 target_result = send_state_and_get_target(state)
                 
                 if "error" in target_result:
-                    self.get_logger().error(f'RL服務器錯誤: {target_result["error"]}')
+                    self.get_logger().error(f'RL server error: {target_result["error"]}')
                     continue
                 
                 target_point = target_result.get('target_point')
                 if target_point is None:
-                    self.get_logger().warning(f'RL服務器未返回 {robot_name} 的目標點')
+                    self.get_logger().warning(f'RL server did not return target point for {robot_name}')
                     continue
                 
                 if self.is_point_too_close_to_other_target(target_point, robot_name):
-                    self.get_logger().warning(f'{robot_name} 的目標點太接近其他機器人目標，尋找替代點')
+                    self.get_logger().warning(f'{robot_name} target point too close to other robot target, finding alternative')
                     alternative_target = self.find_alternative_target(filtered_points, robot_name)
                     if alternative_target:
                         target_point = alternative_target
-                        self.get_logger().info(f'為 {robot_name} 找到替代目標: {alternative_target}')
+                        self.get_logger().info(f'Found alternative target for {robot_name}: {alternative_target}')
                     else:
-                        self.get_logger().warning(f'無法為 {robot_name} 找到合適的替代目標')
+                        self.get_logger().warning(f'Cannot find suitable alternative target for {robot_name}')
                         continue
                 
-                # 分配目標並立即啟用絕對鎖定
+                # Assign target and immediately enable absolute lock
                 self.publish_target_to_robot(robot_name, target_point)
                 
             except Exception as e:
-                self.get_logger().error(f'為 {robot_name} 分配目標時發生錯誤: {e}')
+                self.get_logger().error(f'Error assigning target for {robot_name}: {e}')
 
     def find_alternative_target(self, available_points, robot_name):
-        """為機器人尋找替代目標點"""
+        """Find alternative target point for robot"""
         robot_pose = getattr(self, f'{robot_name}_pose')
         robot_pos = [robot_pose.position.x, robot_pose.position.y]
         
@@ -410,17 +413,17 @@ class ImprovedSocketAssigner(Node):
         return distances[0][0]
 
     def publish_target_to_robot(self, robot_name, target):
-        """發布目標點給機器人並立即啟用絕對鎖定"""
-        # 立即鎖定目標
+        """Publish target point to robot and immediately enable absolute lock"""
+        # Immediately lock target
         self.assigned_targets[robot_name] = target
         self.target_locked[robot_name] = True
         self.target_assignment_time[robot_name] = self.get_clock().now()
         
-        # 重置運動狀態
+        # Reset motion state
         self.robot_static_time[robot_name] = 0.0
         self.robot_last_move_time[robot_name] = self.get_clock().now()
         
-        # 創建目標訊息
+        # Create target message
         target_pose = PoseStamped()
         target_pose.header.frame_id = 'merge_map'
         target_pose.header.stamp = self.get_clock().now().to_msg()
@@ -428,20 +431,20 @@ class ImprovedSocketAssigner(Node):
         target_pose.pose.position.y = target[1]
         target_pose.pose.orientation.w = 1.0
 
-        # 發布到對應的topic
+        # Publish to corresponding topic
         if robot_name == 'robot1':
             self.robot1_target_pub.publish(target_pose)
         else:
             self.robot2_target_pub.publish(target_pose)
 
-        # 發布除錯訊息
+        # Publish debug message
         debug_msg = String()
-        debug_msg.data = f'🔒 絕對鎖定目標: {robot_name} -> {target} (已鎖定，絕不切換)'
+        debug_msg.data = f'Target locked: {robot_name} -> {target} (locked, never switch)'
         self.debug_pub.publish(debug_msg)
-        self.get_logger().error(debug_msg.data)
+        self.get_logger().info(debug_msg.data)
 
     def publish_debug_info(self):
-        """發布詳細除錯資訊"""
+        """Publish detailed debug information"""
         debug_msg = String()
         debug_info = {
             "robot1_pose": "OK" if self.robot1_pose else "MISSING",
@@ -458,7 +461,7 @@ class ImprovedSocketAssigner(Node):
             "robot1_cmd_vel": f"{self.robot_cmd_vel['robot1']:.3f}" if self.robot_cmd_vel['robot1'] else "None",
             "robot2_cmd_vel": f"{self.robot_cmd_vel['robot2']:.3f}" if self.robot_cmd_vel['robot2'] else "None"
         }
-        debug_msg.data = f"改進分配器狀態: {json.dumps(debug_info, ensure_ascii=False)}"
+        debug_msg.data = f"Test Socket Assigner status: {json.dumps(debug_info, ensure_ascii=False)}"
         self.debug_pub.publish(debug_msg)
 
     def create_target_marker(self, point, robot_name, marker_id):
@@ -478,14 +481,14 @@ class ImprovedSocketAssigner(Node):
         is_locked = self.target_locked[robot_name]
         if robot_name == 'robot1':
             if is_locked:
-                marker.color = ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0)  # 亮紅色：鎖定
+                marker.color = ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0)  # Bright red: locked
             else:
-                marker.color = ColorRGBA(r=0.8, g=0.4, b=0.4, a=0.8)  # 暗紅色：未鎖定
+                marker.color = ColorRGBA(r=0.8, g=0.4, b=0.4, a=0.8)  # Dark red: unlocked
         else:
             if is_locked:
-                marker.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)  # 亮綠色：鎖定
+                marker.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)  # Bright green: locked
             else:
-                marker.color = ColorRGBA(r=0.4, g=0.8, b=0.4, a=0.8)  # 暗綠色：未鎖定
+                marker.color = ColorRGBA(r=0.4, g=0.8, b=0.4, a=0.8)  # Dark green: unlocked
                 
         return marker
 
@@ -506,12 +509,12 @@ class ImprovedSocketAssigner(Node):
 def main(args=None):
     rclpy.init(args=args)
     try:
-        node = ImprovedSocketAssigner()
+        node = TestSocketAssigner()
         rclpy.spin(node)
     except KeyboardInterrupt:
-        print("收到中斷信號，正在關閉...")
+        print("Received interrupt signal, shutting down...")
     except Exception as e:
-        print(f'錯誤: {str(e)}')
+        print(f'Error: {str(e)}')
         import traceback
         traceback.print_exc()
     finally:
